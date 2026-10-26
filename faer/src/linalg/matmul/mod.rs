@@ -42,7 +42,7 @@ std::thread_local! {
 fn caller_workspace_active() -> bool {
 	#[cfg(feature = "std")]
 	{
-		return CALLER_WORKSPACE.with(core::cell::Cell::get);
+		CALLER_WORKSPACE.with(core::cell::Cell::get)
 	}
 	#[cfg(not(feature = "std"))]
 	false
@@ -57,13 +57,13 @@ impl GemmWorkspace {
 			let optimized = std::arch::is_x86_feature_detected!("avx512f")
 				|| (std::arch::is_x86_feature_detected!("avx2")
 					&& std::arch::is_x86_feature_detected!("fma"));
-			return Ok(Self {
+			Ok(Self {
 				inner: if optimized {
 					Some(private_gemm_x86::Workspace::try_new()?)
 				} else {
 					None
 				},
-			});
+			})
 		}
 		#[cfg(not(target_arch = "x86_64"))]
 		Ok(Self {})

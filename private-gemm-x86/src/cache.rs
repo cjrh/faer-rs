@@ -353,7 +353,7 @@ static DETECTED_CACHE_INFO: std::sync::OnceLock<[CacheInfo; 3]> = std::sync::Onc
 pub(crate) fn allocation_free_cache_info() -> &'static [CacheInfo; 3] {
 	#[cfg(feature = "std")]
 	{
-		return detected_cache_info(false);
+		detected_cache_info(false)
 	}
 	#[cfg(not(feature = "std"))]
 	{
