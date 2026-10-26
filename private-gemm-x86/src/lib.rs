@@ -10,6 +10,50 @@ use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
 use cache::CACHE_INFO;
 
+#[repr(align(4096))]
+struct Page([u8; 4096]);
+
+thread_local! {
+	static MEM: RefCell<Vec<core::mem::MaybeUninit<Page>>> = const { RefCell::new(Vec::new()) };
+	// No destructor registration or allocation: ownership stays with the caller.
+	static PROVIDED: core::cell::Cell<*mut Workspace> = const { core::cell::Cell::new(core::ptr::null_mut()) };
+}
+
+/// Caller-owned packing storage for sequential native GEMM calls.
+///
+/// Covers every matrix shape and native scalar type. Cache discovery and scoped
+/// dispatch allocate nothing, including with the `std` feature enabled.
+pub struct Workspace {
+	mem: Vec<core::mem::MaybeUninit<Page>>,
+}
+
+impl Workspace {
+	pub fn try_new() -> Result<Self, std::collections::TryReserveError> {
+		let cache = cache::allocation_free_cache_info();
+		// Each side rounds by at most 256 bytes before page rounding.
+		let required = 2 * (cache[2].cache_bytes.div_ceil(size_of::<Page>()) + 1);
+		let mut mem = Vec::new();
+		mem.try_reserve_exact(required)?;
+		// SAFETY: MaybeUninit<Page> needs no initialization; capacity was reserved.
+		unsafe { mem.set_len(required) };
+		Ok(Self { mem })
+	}
+
+	/// Run sequential kernels using this storage on the current thread.
+	/// Nested scopes with other workspaces and unwinding restore the prior scope.
+	/// This does not prepare worker threads or initialize a parallel executor.
+	pub fn with<R>(&mut self, f: impl FnOnce() -> R) -> R {
+		struct Restore(*mut Workspace);
+		impl Drop for Restore {
+			fn drop(&mut self) {
+				PROVIDED.with(|slot| slot.set(self.0));
+			}
+		}
+		let _restore = Restore(PROVIDED.with(|slot| slot.replace(self)));
+		f()
+	}
+}
+
 include!(concat!(env!("OUT_DIR"), "/asm.rs"));
 
 #[derive(Copy, Clone, Debug)]
@@ -1277,46 +1321,10 @@ pub unsafe fn gemm(
 	let l2 = cache[1].cache_bytes / sizeof;
 	let l3 = cache[2].cache_bytes / sizeof;
 
-	#[repr(align(4096))]
-	struct Page([u8; 4096]);
-
 	let lhs_size = (l3.next_multiple_of(16) * sizeof).div_ceil(size_of::<Page>());
 	let rhs_size = (l3.next_multiple_of(nr) * sizeof).div_ceil(size_of::<Page>());
 
-	thread_local! {
-		static MEM: RefCell<Vec::<core::mem::MaybeUninit<Page>>> = {
-			let cache = *cache::CACHE_INFO;
-			let l3 = cache[2].cache_bytes;
-
-			let lhs_size = l3.div_ceil(size_of::<Page>());
-			let rhs_size = l3.div_ceil(size_of::<Page>());
-
-			let mut mem = Vec::with_capacity(lhs_size + rhs_size);
-			unsafe { mem.set_len(lhs_size + rhs_size) };
-			RefCell::new(mem)
-		};
-	}
-
-	MEM.with(|mem| {
-		let mut storage;
-		let mut alloc;
-
-		let mem = match mem.try_borrow_mut() {
-			Ok(mem) => {
-				storage = mem;
-				&mut *storage
-			},
-			Err(_) => {
-				alloc = Vec::with_capacity(lhs_size + rhs_size);
-
-				&mut alloc
-			},
-		};
-		if mem.len() < lhs_size + rhs_size {
-			mem.reserve_exact(lhs_size + rhs_size);
-			unsafe { mem.set_len(lhs_size + rhs_size) };
-		}
-
+	let run = |mem: &mut [core::mem::MaybeUninit<Page>]| {
 		let (packed_lhs, packed_rhs) = mem.split_at_mut(lhs_size);
 		let (packed_rhs, _) = packed_rhs.split_at_mut(rhs_size);
 
@@ -1363,12 +1371,14 @@ pub unsafe fn gemm(
 						| match itype {
 							IType::U32 => FLAGS_32BIT_IDX,
 							IType::U64 => 0,
-						} | if cplx { FLAGS_CPLX } else { 0 }
+						}
+						| if cplx { FLAGS_CPLX } else { 0 }
 						| match dst_kind {
 							DstKind::Lower => FLAGS_LOWER,
 							DstKind::Upper => FLAGS_UPPER,
 							DstKind::Full => 0,
-						} | if rowmajor { FLAGS_ROWMAJOR } else { 0 },
+						}
+						| if rowmajor { FLAGS_ROWMAJOR } else { 0 },
 					depth: kc,
 					lhs_rs,
 					lhs_cs,
@@ -1444,8 +1454,8 @@ pub unsafe fn gemm(
 							if row_chunk[i - 1] >= l3 {
 								row_chunk[i - 1] = Ord::min(row_chunk[i - 1], 2 * row_chunk[i]);
 							}
-							// this step is the last one because we want to enforce that the chunk size is at least
-							// as large as the ones that are nested within it
+							// this step is the last one because we want to enforce that the chunk
+							// size is at least as large as the ones that are nested within it
 							row_chunk[i - 1] = Ord::max(row_chunk[i - 1].next_multiple_of(row_chunk[i]), row_chunk[i]);
 						}
 						for i in (1..q - 1).rev() {
@@ -1515,7 +1525,32 @@ pub unsafe fn gemm(
 			#[cfg(not(feature = "rayon"))]
 			f();
 		}
-	});
+	};
+	let provided = PROVIDED.with(|slot| slot.get());
+	if !provided.is_null() {
+		// SAFETY: Workspace::with holds an exclusive borrow for the full scope.
+		// Native kernels invoke no caller code and cannot reenter this scope.
+		// A nested scope uses its own exclusive workspace and restores this pointer.
+		unsafe { run(&mut (*provided).mem) };
+	} else {
+		// Preserve the legacy infallible API outside an explicit workspace scope.
+		MEM.with(|mem| {
+			let mut storage;
+			let mut alloc = Vec::new();
+			let mem = match mem.try_borrow_mut() {
+				Ok(mem) => {
+					storage = mem;
+					&mut *storage
+				},
+				Err(_) => &mut alloc,
+			};
+			if mem.len() < lhs_size + rhs_size {
+				mem.reserve_exact(lhs_size + rhs_size - mem.len());
+				unsafe { mem.set_len(lhs_size + rhs_size) };
+			}
+			run(mem);
+		});
+	}
 }
 
 pub unsafe fn kernel(
@@ -3365,7 +3400,9 @@ mod tests_c32_gather_scatter {
 														packed_rhs_cs: 4 * sizeof * k as isize,
 														micro: MicrokernelInfo {
 															flags: ((conj_lhs as usize) << 1)
-																| ((conj_different as usize) << 2) | (1 << 4) | (1 << 5),
+																| ((conj_different as usize) << 2)
+																| (1 << 4)
+																| (1 << 5),
 															depth: k,
 															lhs_rs: 1 * sizeof,
 															lhs_cs: cs as isize * sizeof,
@@ -3493,8 +3530,10 @@ mod tests_c32_gather_scatter {
 														packed_rhs_cs: 4 * sizeof * k as isize,
 														micro: MicrokernelInfo {
 															flags: ((conj_lhs as usize) * FLAGS_CONJ_LHS)
-																| ((conj_different as usize) * FLAGS_CONJ_NEQ) | (1 * FLAGS_UPPER)
-																| (1 * FLAGS_32BIT_IDX) | (1 * FLAGS_CPLX),
+																| ((conj_different as usize) * FLAGS_CONJ_NEQ)
+																| (1 * FLAGS_UPPER)
+																| (1 * FLAGS_32BIT_IDX)
+																| (1 * FLAGS_CPLX),
 															depth: k,
 															lhs_rs: 2 * sizeof,
 															lhs_cs: 2 * cs as isize * sizeof,

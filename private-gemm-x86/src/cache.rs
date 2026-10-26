@@ -5,9 +5,9 @@ pub struct CacheInfo {
 	pub cache_line_bytes: usize,
 }
 
-fn cache_info() -> Option<[CacheInfo; 3]> {
+fn cache_info(allow_alloc: bool) -> Option<[CacheInfo; 3]> {
 	if !cfg!(miri) {
-		{
+		if allow_alloc {
 			#[cfg(all(target_os = "linux", feature = "std"))]
 			{
 				use std::fs;
@@ -347,25 +347,40 @@ static CACHE_INFO_DEFAULT: [CacheInfo; 3] = [
 
 pub struct CacheInfoDeref;
 
+#[cfg(feature = "std")]
+static DETECTED_CACHE_INFO: std::sync::OnceLock<[CacheInfo; 3]> = std::sync::OnceLock::new();
+
+pub(crate) fn allocation_free_cache_info() -> &'static [CacheInfo; 3] {
+	#[cfg(feature = "std")]
+	{
+		return detected_cache_info(false);
+	}
+	#[cfg(not(feature = "std"))]
+	{
+		&CACHE_INFO_DEFAULT
+	}
+}
+
+#[cfg(feature = "std")]
+fn detected_cache_info(allow_alloc: bool) -> &'static [CacheInfo; 3] {
+	DETECTED_CACHE_INFO.get_or_init(|| {
+		let mut val = cache_info(allow_alloc).unwrap_or(CACHE_INFO_DEFAULT);
+		val[0].cache_bytes = Ord::max(val[0].cache_bytes, CACHE_INFO_DEFAULT[0].cache_bytes);
+		val[1].cache_bytes = Ord::max(val[1].cache_bytes, CACHE_INFO_DEFAULT[1].cache_bytes);
+		val[1].cache_bytes = Ord::max(val[1].cache_bytes, val[0].cache_bytes.checked_mul(4).unwrap());
+		val[2].cache_bytes = Ord::max(val[2].cache_bytes, CACHE_INFO_DEFAULT[2].cache_bytes);
+		val[2].cache_bytes = Ord::max(val[2].cache_bytes, val[1].cache_bytes.checked_mul(4).unwrap());
+		val
+	})
+}
+
 impl core::ops::Deref for CacheInfoDeref {
 	type Target = [CacheInfo; 3];
 
 	#[cfg(feature = "std")]
 	#[inline]
 	fn deref(&self) -> &Self::Target {
-		static CACHE_INFO: std::sync::OnceLock<[CacheInfo; 3]> = std::sync::OnceLock::new();
-
-		CACHE_INFO.get_or_init(|| {
-			let mut val = cache_info().unwrap_or(CACHE_INFO_DEFAULT);
-			val[0].cache_bytes = Ord::max(val[0].cache_bytes, CACHE_INFO_DEFAULT[0].cache_bytes);
-
-			val[1].cache_bytes = Ord::max(val[1].cache_bytes, CACHE_INFO_DEFAULT[1].cache_bytes);
-			val[1].cache_bytes = Ord::max(val[1].cache_bytes, val[0].cache_bytes.checked_mul(4).unwrap());
-
-			val[2].cache_bytes = Ord::max(val[2].cache_bytes, CACHE_INFO_DEFAULT[2].cache_bytes);
-			val[2].cache_bytes = Ord::max(val[2].cache_bytes, val[1].cache_bytes.checked_mul(4).unwrap());
-			val
-		})
+		detected_cache_info(true)
 	}
 
 	#[cfg(not(feature = "std"))]

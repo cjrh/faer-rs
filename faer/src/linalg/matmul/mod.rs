@@ -14,6 +14,79 @@ use faer_traits::{ByRef, ComplexField, Conjugate};
 use pulp::Simd;
 use reborrow::*;
 const NANO_GEMM_THRESHOLD: usize = 16 * 16 * 16;
+
+/// Caller-owned, fallibly allocated packing workspace for sequential GEMM.
+///
+/// Run a dense numerical operation with [`Par::Seq`] inside [`Self::with`]. The
+/// workspace covers native f32/f64 and complex GEMM, including triangular and
+/// indexed dispatch inside decompositions, for every matrix shape. It may be
+/// reused across calls, then dropped normally; no owning thread-local cache is
+/// initialized within the scope. Scoped dispatch uses a non-dropping TLS
+/// pointer. Other scratch/outputs must still be supplied by the caller.
+/// High-level owned matrix APIs and parallel execution retain their existing
+/// allocation contracts.
+///
+/// On targets without the optimized x86 backend, the allocation-free nano-gemm
+/// path needs no reservation. This API does not start a thread pool.
+#[cfg(feature = "std")]
+pub struct GemmWorkspace {
+	#[cfg(target_arch = "x86_64")]
+	inner: Option<private_gemm_x86::Workspace>,
+}
+
+#[cfg(feature = "std")]
+std::thread_local! {
+	static CALLER_WORKSPACE: core::cell::Cell<bool> = const { core::cell::Cell::new(false) };
+}
+
+fn caller_workspace_active() -> bool {
+	#[cfg(feature = "std")]
+	{
+		return CALLER_WORKSPACE.with(core::cell::Cell::get);
+	}
+	#[cfg(not(feature = "std"))]
+	false
+}
+
+#[cfg(feature = "std")]
+impl GemmWorkspace {
+	/// Reserve packing storage fallibly before entering a numerical kernel.
+	pub fn try_new() -> Result<Self, std::collections::TryReserveError> {
+		#[cfg(target_arch = "x86_64")]
+		{
+			let optimized = std::arch::is_x86_feature_detected!("avx512f")
+				|| (std::arch::is_x86_feature_detected!("avx2")
+					&& std::arch::is_x86_feature_detected!("fma"));
+			return Ok(Self {
+				inner: if optimized {
+					Some(private_gemm_x86::Workspace::try_new()?)
+				} else {
+					None
+				},
+			});
+		}
+		#[cfg(not(target_arch = "x86_64"))]
+		Ok(Self {})
+	}
+
+	/// Execute on this thread with caller-owned GEMM packing storage.
+	/// Nested scopes and panics restore the prior workspace automatically.
+	pub fn with<R>(&mut self, f: impl FnOnce() -> R) -> R {
+		struct Restore(bool);
+		impl Drop for Restore {
+			fn drop(&mut self) {
+				CALLER_WORKSPACE.with(|slot| slot.set(self.0));
+			}
+		}
+		let _restore =
+			Restore(CALLER_WORKSPACE.with(|slot| slot.replace(true)));
+		#[cfg(target_arch = "x86_64")]
+		if let Some(inner) = &mut self.inner {
+			return inner.with(f);
+		}
+		f()
+	}
+}
 const PAR_THRESHOLD_MNK: usize = 4096;
 pub(crate) mod internal;
 /// triangular matrix multiplication module, where some of the operands are
@@ -1412,21 +1485,22 @@ fn matmul_imp<'M, 'N, 'K, T: ComplexField>(
 								return;
 							}
 						}
-						{
-							gemm::gemm(
+						if caller_workspace_active() {
+							// Portable fallback inside a caller-owned workspace
+							// scope.
+							nano_gemm::planless::$nanogemm(
 								M.unbound(),
 								N.unbound(),
 								K.unbound(),
 								dst.as_ptr_mut(),
-								dst.col_stride(),
 								dst.row_stride(),
-								beta != Accum::Replace,
+								dst.col_stride(),
 								lhs.as_ptr(),
-								lhs.col_stride(),
 								lhs.row_stride(),
+								lhs.col_stride(),
 								rhs.as_ptr(),
-								rhs.col_stride(),
 								rhs.row_stride(),
+								rhs.col_stride(),
 								match beta {
 									Accum::Replace => core::mem::zeroed(),
 									Accum::Add => {
@@ -1434,19 +1508,46 @@ fn matmul_imp<'M, 'N, 'K, T: ComplexField>(
 									},
 								},
 								alpha,
-								false,
 								conj_lhs == Conj::Yes,
 								conj_rhs == Conj::Yes,
-								match par {
-									Par::Seq => gemm::Parallelism::None,
-									#[cfg(feature = "rayon")]
-									Par::Rayon(nthreads) => {
-										gemm::Parallelism::Rayon(nthreads.get())
-									},
-								},
 							);
 							return;
 						}
+						// Preserve the existing backend outside the fallible
+						// scope.
+						gemm::gemm(
+							M.unbound(),
+							N.unbound(),
+							K.unbound(),
+							dst.as_ptr_mut(),
+							dst.col_stride(),
+							dst.row_stride(),
+							beta != Accum::Replace,
+							lhs.as_ptr(),
+							lhs.col_stride(),
+							lhs.row_stride(),
+							rhs.as_ptr(),
+							rhs.col_stride(),
+							rhs.row_stride(),
+							match beta {
+								Accum::Replace => core::mem::zeroed(),
+								Accum::Add => {
+									<$ty as ComplexFieldExt>::from_f64(1.0)
+								},
+							},
+							alpha,
+							false,
+							conj_lhs == Conj::Yes,
+							conj_rhs == Conj::Yes,
+							match par {
+								Par::Seq => gemm::Parallelism::None,
+								#[cfg(feature = "rayon")]
+								Par::Rayon(nthreads) => {
+									gemm::Parallelism::Rayon(nthreads.get())
+								},
+							},
+						);
+						return;
 					}
 				};
 			};
